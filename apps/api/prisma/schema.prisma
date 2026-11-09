@@ -1,0 +1,1706 @@
+// =============================================================================
+// Gym CRM — database schema (PostgreSQL + Prisma)
+// Deployment model: single client business, multiple branches.
+//
+// Conventions
+// - Money is stored as integer paise (Int / BigInt) — never floats.  ₹1,500 = 150000.
+// - Tax rates are stored in basis points (1800 = 18.00%).
+// - All timestamps are UTC (timestamptz). Display in Asia/Kolkata.
+// - "Business dates" (subscription start/end, expense date) use @db.Date.
+// - Soft delete via deletedAt where records need recovery / history.
+// - Financial records (invoices, payments, refunds, allocations) are append-only:
+//   corrections are made with new rows (credit notes, refunds, voids), never UPDATE of amounts.
+// - Branch scoping: every branch-owned row has branchId. The API derives allowed
+//   branches from the session (UserRole), never from the request body.
+// - Constraints Prisma cannot express live in prisma/sql/constraints.sql.
+// =============================================================================
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "cjs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// -----------------------------------------------------------------------------
+// Enums
+// -----------------------------------------------------------------------------
+
+enum RecordStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+  UNDISCLOSED
+}
+
+enum MemberStatus {
+  ACTIVE // has a currently valid subscription
+  EXPIRED
+  FROZEN
+  CANCELLED
+  PROSPECT // registered but never paid
+}
+
+enum SubscriptionStatus {
+  PENDING_PAYMENT
+  SCHEDULED // paid, starts in future (early renewal)
+  ACTIVE
+  FROZEN
+  EXPIRED
+  CANCELLED
+}
+
+enum LeadSource {
+  WALK_IN
+  WEBSITE
+  INSTAGRAM
+  FACEBOOK
+  GOOGLE_ADS
+  WHATSAPP
+  REFERRAL
+  PHONE_CALL
+  OTHER
+}
+
+enum LeadStage {
+  NEW
+  CONTACTED
+  TRIAL_SCHEDULED
+  TRIAL_COMPLETED
+  FOLLOW_UP
+  CONVERTED
+  LOST
+}
+
+enum LeadPriority {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum LeadActivityType {
+  NOTE
+  CALL
+  WHATSAPP
+  SMS
+  EMAIL
+  VISIT
+  STAGE_CHANGE
+  ASSIGNMENT
+}
+
+enum TrialStatus {
+  SCHEDULED
+  COMPLETED
+  NO_SHOW
+  CANCELLED
+}
+
+enum AttendanceMethod {
+  QR
+  MEMBER_CODE
+  PHONE_LOOKUP
+  RFID
+  BIOMETRIC
+  MANUAL
+}
+
+enum AttendanceResult {
+  ALLOWED
+  DENIED
+}
+
+enum AttendanceDenyReason {
+  NOT_FOUND
+  NO_ACTIVE_SUBSCRIPTION
+  SUBSCRIPTION_FROZEN
+  BRANCH_NOT_ALLOWED
+  OUTSIDE_ACCESS_HOURS
+  ALREADY_CHECKED_IN
+  RESTRICTION_FLAG
+  DEVICE_NOT_TRUSTED
+}
+
+enum InvoiceStatus {
+  DRAFT
+  ISSUED
+  PARTIALLY_PAID
+  PAID
+  VOID
+}
+
+enum InvoiceItemType {
+  MEMBERSHIP
+  REGISTRATION_FEE
+  PT_PACKAGE
+  PRODUCT
+  OTHER
+}
+
+enum PaymentMethod {
+  CASH
+  UPI
+  CARD
+  BANK_TRANSFER
+  GATEWAY
+}
+
+enum PaymentStatus {
+  PENDING
+  CONFIRMED
+  FAILED
+}
+
+enum GatewayOrderStatus {
+  CREATED
+  PAID
+  FAILED
+  EXPIRED
+}
+
+enum RefundStatus {
+  REQUESTED
+  APPROVED
+  PROCESSED
+  REJECTED
+}
+
+enum PtSessionStatus {
+  SCHEDULED
+  COMPLETED
+  CANCELLED_BY_MEMBER
+  CANCELLED_BY_TRAINER
+  NO_SHOW
+}
+
+enum EquipmentCondition {
+  GOOD
+  NEEDS_SERVICE
+  UNDER_REPAIR
+  OUT_OF_ORDER
+  RETIRED
+}
+
+enum StockMovementType {
+  PURCHASE
+  SALE
+  ADJUSTMENT
+  RETURN
+  WRITE_OFF
+  TRANSFER_IN
+  TRANSFER_OUT
+}
+
+enum EmploymentStatus {
+  ACTIVE
+  ON_NOTICE
+  EXITED
+}
+
+enum LeaveStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum PayrollStatus {
+  DRAFT
+  FINALIZED
+  PAID
+}
+
+enum NotificationChannel {
+  WHATSAPP
+  SMS
+  EMAIL
+  IN_APP
+}
+
+enum NotificationStatus {
+  QUEUED
+  SENT
+  DELIVERED
+  FAILED
+  SKIPPED_NO_CONSENT
+}
+
+enum ConsentPurpose {
+  PRIVACY_NOTICE
+  HEALTH_DATA_PROCESSING
+  MARKETING_WHATSAPP
+  MARKETING_SMS
+  MARKETING_EMAIL
+  PHOTO_USE
+}
+
+enum AuditResult {
+  SUCCESS
+  DENIED
+  FAILED
+}
+
+enum AuthFactorType {
+  TOTP
+}
+
+enum OtpPurpose {
+  LOGIN
+  PASSWORD_RESET
+  PHONE_VERIFY
+}
+
+// -----------------------------------------------------------------------------
+// Business & branches
+// -----------------------------------------------------------------------------
+
+/// Single row: the client business (legal entity, GST, branding).
+model Business {
+  id           String   @id @default(uuid()) @db.Uuid
+  legalName    String
+  brandName    String
+  gstin        String?  @db.VarChar(15)
+  pan          String?  @db.VarChar(10)
+  stateCode    String   @db.VarChar(2) // GST state code of registered place
+  logoFileId   String?  @db.Uuid
+  currency     String   @default("INR") @db.VarChar(3)
+  timezone     String   @default("Asia/Kolkata")
+  fyStartMonth Int      @default(4) // April
+  createdAt    DateTime @default(now()) @db.Timestamptz
+  updatedAt    DateTime @updatedAt @db.Timestamptz
+
+  logoFile FileObject? @relation("BusinessLogo", fields: [logoFileId], references: [id])
+}
+
+model Branch {
+  id           String       @id @default(uuid()) @db.Uuid
+  code         String       @unique @db.VarChar(10) // e.g. "CBE-A" — used in member codes / invoice series
+  name         String
+  addressLine1 String
+  addressLine2 String?
+  city         String
+  state        String
+  stateCode    String       @db.VarChar(2)
+  pincode      String       @db.VarChar(6)
+  phone        String?
+  email        String?
+  gstin        String?      @db.VarChar(15) // if branch has separate registration
+  status       RecordStatus @default(ACTIVE)
+  createdAt    DateTime     @default(now()) @db.Timestamptz
+  updatedAt    DateTime     @updatedAt @db.Timestamptz
+
+  openingHours     BranchHours[]
+  closures         BranchClosure[]
+  members          Member[]
+  userRoles        UserRole[]
+  devices          Device[]
+  attendance       Attendance[]
+  leads            Lead[]
+  invoices         Invoice[]
+  payments         Payment[]
+  expenses         Expense[]
+  equipment        Equipment[]
+  stockMovements   StockMovement[]
+  staff            Staff[]
+  planBranches     MembershipPlanBranch[]
+  invoiceSequences InvoiceSequence[]
+  settings         BranchSetting[]
+  ptSessions       PtSession[]
+  transfersFrom    MemberBranchTransfer[] @relation("TransferFrom")
+  transfersTo      MemberBranchTransfer[] @relation("TransferTo")
+}
+
+model BranchHours {
+  id        String @id @default(uuid()) @db.Uuid
+  branchId  String @db.Uuid
+  dayOfWeek Int // 0 = Sunday
+  opensAt   String @db.VarChar(5) // "05:30" local time
+  closesAt  String @db.VarChar(5) // "22:00"
+
+  branch Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@unique([branchId, dayOfWeek, opensAt])
+}
+
+/// Temporary closures; can trigger automatic subscription extensions.
+model BranchClosure {
+  id                  String   @id @default(uuid()) @db.Uuid
+  branchId            String   @db.Uuid
+  startDate           DateTime @db.Date
+  endDate             DateTime @db.Date
+  reason              String
+  extendSubscriptions Boolean  @default(true)
+  createdById         String   @db.Uuid
+  createdAt           DateTime @default(now()) @db.Timestamptz
+
+  branch    Branch @relation(fields: [branchId], references: [id])
+  createdBy User   @relation(fields: [createdById], references: [id])
+}
+
+/// Configurable business rules (freeze limits, renewal policy, refund rules, guest policy …).
+/// branchId NULL = business-wide default; a branch row overrides it.
+model BranchSetting {
+  id          String   @id @default(uuid()) @db.Uuid
+  branchId    String?  @db.Uuid
+  key         String // e.g. "freeze.maxDaysPerYear", "renewal.earlyPolicy", "checkin.duplicateWindowMinutes"
+  value       Json
+  updatedById String   @db.Uuid
+  updatedAt   DateTime @updatedAt @db.Timestamptz
+
+  branch    Branch? @relation(fields: [branchId], references: [id])
+  updatedBy User    @relation(fields: [updatedById], references: [id])
+
+  @@unique([branchId, key]) // NULL-branch uniqueness enforced in constraints.sql
+}
+
+// -----------------------------------------------------------------------------
+// Identity, auth & access control
+// -----------------------------------------------------------------------------
+
+/// A login identity. Staff and members both log in through User.
+model User {
+  id                String       @id @default(uuid()) @db.Uuid
+  email             String?      @unique
+  phone             String?      @unique @db.VarChar(15) // E.164, e.g. +919876543210
+  passwordHash      String? // Argon2id. Null for OTP-only member logins.
+  displayName       String
+  status            RecordStatus @default(ACTIVE)
+  mfaRequired       Boolean      @default(false)
+  failedLoginCount  Int          @default(0)
+  lockedUntil       DateTime?    @db.Timestamptz
+  lastLoginAt       DateTime?    @db.Timestamptz
+  passwordChangedAt DateTime?    @db.Timestamptz
+  createdAt         DateTime     @default(now()) @db.Timestamptz
+  updatedAt         DateTime     @updatedAt @db.Timestamptz
+  deletedAt         DateTime?    @db.Timestamptz
+
+  roles         UserRole[]
+  sessions      Session[]
+  authFactors   AuthFactor[]
+  otpChallenges OtpChallenge[]
+  resetTokens   PasswordResetToken[]
+  staff         Staff?
+  member        Member?              @relation("MemberLogin")
+  auditLogs     AuditLog[]
+
+  // back-relations for "created by / assigned to" fields
+  createdMembers   Member[]               @relation("MemberCreatedBy")
+  assignedLeads    Lead[]                 @relation("LeadAssignee")
+  leadActivities   LeadActivity[]
+  createdInvoices  Invoice[]              @relation("InvoiceCreatedBy")
+  receivedPayments Payment[]              @relation("PaymentReceivedBy")
+  requestedRefunds Refund[]               @relation("RefundRequestedBy")
+  approvedRefunds  Refund[]               @relation("RefundApprovedBy")
+  expenses         Expense[]              @relation("ExpenseCreatedBy")
+  closures         BranchClosure[]
+  settingsChanged  BranchSetting[]
+  consentsRecorded ConsentRecord[]        @relation("ConsentRecordedBy")
+  healthAccessLogs HealthRecordAccess[]
+  freezesApproved  SubscriptionFreeze[]
+  transfersDone    MemberBranchTransfer[]
+  attendanceManual Attendance[]           @relation("AttendanceOperator")
+  memberNotes      MemberNote[]
+  uploadedFiles    FileObject[]           @relation("FileUploadedBy")
+  stockMovements   StockMovement[]
+  maintenanceLogs  MaintenanceLog[]
+  payrollRuns      PayrollRun[]
+  leaveApprovals   LeaveRequest[]         @relation("LeaveApprover")
+}
+
+model Role {
+  id          String   @id @default(uuid()) @db.Uuid
+  key         String   @unique // OWNER, BRANCH_MANAGER, GYM_ADMIN, RECEPTIONIST, TRAINER, ACCOUNTANT, MEMBER, or custom
+  name        String
+  description String?
+  isSystem    Boolean  @default(false) // system roles cannot be deleted
+  createdAt   DateTime @default(now()) @db.Timestamptz
+  updatedAt   DateTime @updatedAt @db.Timestamptz
+
+  permissions RolePermission[]
+  users       UserRole[]
+}
+
+/// Permission catalogue, seeded from code. Key format "<resource>.<action>[.<scope>]",
+/// e.g. "members.read", "members.read.assigned", "payments.collect", "reports.revenue.read".
+model Permission {
+  id          String @id @default(uuid()) @db.Uuid
+  key         String @unique
+  description String
+
+  roles RolePermission[]
+}
+
+model RolePermission {
+  roleId       String @db.Uuid
+  permissionId String @db.Uuid
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+}
+
+/// Role grant, optionally limited to one branch. branchId NULL = all branches.
+model UserRole {
+  id          String   @id @default(uuid()) @db.Uuid
+  userId      String   @db.Uuid
+  roleId      String   @db.Uuid
+  branchId    String?  @db.Uuid
+  grantedAt   DateTime @default(now()) @db.Timestamptz
+  grantedById String?  @db.Uuid
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role   Role    @relation(fields: [roleId], references: [id])
+  branch Branch? @relation(fields: [branchId], references: [id])
+
+  @@unique([userId, roleId, branchId])
+  @@index([branchId])
+}
+
+/// Server-side session. The cookie carries only a random id; we store its SHA-256.
+model Session {
+  id             String    @id @default(uuid()) @db.Uuid
+  userId         String    @db.Uuid
+  tokenHash      String    @unique @db.VarChar(64)
+  csrfSecretHash String    @db.VarChar(64)
+  ipAddress      String?   @db.Inet
+  userAgent      String?
+  deviceLabel    String?
+  mfaVerifiedAt  DateTime? @db.Timestamptz
+  createdAt      DateTime  @default(now()) @db.Timestamptz
+  lastSeenAt     DateTime  @default(now()) @db.Timestamptz
+  expiresAt      DateTime  @db.Timestamptz
+  revokedAt      DateTime? @db.Timestamptz
+  revokeReason   String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, revokedAt])
+}
+
+model AuthFactor {
+  id              String         @id @default(uuid()) @db.Uuid
+  userId          String         @db.Uuid
+  type            AuthFactorType
+  secretEncrypted Bytes // TOTP secret, encrypted with app KMS key
+  confirmedAt     DateTime?      @db.Timestamptz
+  createdAt       DateTime       @default(now()) @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+/// OTPs are never stored in plain text.
+model OtpChallenge {
+  id         String     @id @default(uuid()) @db.Uuid
+  userId     String?    @db.Uuid
+  phone      String     @db.VarChar(15)
+  purpose    OtpPurpose
+  codeHash   String
+  attempts   Int        @default(0)
+  expiresAt  DateTime   @db.Timestamptz
+  consumedAt DateTime?  @db.Timestamptz
+  createdAt  DateTime   @default(now()) @db.Timestamptz
+
+  user User? @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([phone, purpose, createdAt])
+}
+
+model PasswordResetToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @db.Uuid
+  tokenHash String    @unique @db.VarChar(64)
+  expiresAt DateTime  @db.Timestamptz
+  usedAt    DateTime? @db.Timestamptz
+  createdAt DateTime  @default(now()) @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+/// Stored responses for idempotent POSTs (payments, refunds, check-ins).
+model IdempotencyKey {
+  key          String   @db.VarChar(100)
+  userId       String   @db.Uuid
+  endpoint     String
+  requestHash  String   @db.VarChar(64)
+  responseCode Int?
+  responseBody Json?
+  createdAt    DateTime @default(now()) @db.Timestamptz
+  expiresAt    DateTime @db.Timestamptz
+
+  @@id([userId, key])
+}
+
+// -----------------------------------------------------------------------------
+// Files
+// -----------------------------------------------------------------------------
+
+/// Private S3 objects (photos, documents, invoice PDFs). Served via short-lived signed URLs.
+model FileObject {
+  id           String    @id @default(uuid()) @db.Uuid
+  storageKey   String    @unique
+  originalName String
+  mimeType     String
+  sizeBytes    Int
+  sha256       String    @db.VarChar(64)
+  scanStatus   String    @default("PENDING") // PENDING | CLEAN | INFECTED
+  uploadedById String?   @db.Uuid
+  createdAt    DateTime  @default(now()) @db.Timestamptz
+  deletedAt    DateTime? @db.Timestamptz
+
+  uploadedBy      User?            @relation("FileUploadedBy", fields: [uploadedById], references: [id])
+  businessLogo    Business[]       @relation("BusinessLogo")
+  memberPhotos    Member[]         @relation("MemberPhoto")
+  memberDocuments MemberDocument[]
+  invoicePdfs     Invoice[]        @relation("InvoicePdf")
+  expenseReceipts Expense[]        @relation("ExpenseReceipt")
+  payslipPdfs     Payslip[]
+}
+
+// -----------------------------------------------------------------------------
+// Members
+// -----------------------------------------------------------------------------
+
+model Member {
+  id                   String       @id @default(uuid()) @db.Uuid
+  memberCode           String       @unique @db.VarChar(20) // e.g. "CBE-A-000123"
+  homeBranchId         String       @db.Uuid
+  userId               String?      @unique @db.Uuid // portal login (optional)
+  firstName            String
+  lastName             String?
+  phone                String       @db.VarChar(15)
+  email                String?
+  dateOfBirth          DateTime?    @db.Date
+  gender               Gender?
+  addressLine1         String?
+  addressLine2         String?
+  city                 String?
+  pincode              String?      @db.VarChar(6)
+  emergencyName        String?
+  emergencyPhone       String?      @db.VarChar(15)
+  emergencyRelation    String?
+  photoFileId          String?      @db.Uuid
+  qrToken              String       @unique @db.VarChar(64) // rotatable, opaque; never the member id
+  rfidTag              String?      @unique
+  status               MemberStatus @default(PROSPECT) // denormalised; recomputed by job + on subscription change
+  hasAccessRestriction Boolean      @default(false) // e.g. dues block or manager review
+  restrictionNote      String?
+  joinedOn             DateTime     @db.Date
+  convertedFromLeadId  String?      @unique @db.Uuid
+  createdById          String       @db.Uuid
+  createdAt            DateTime     @default(now()) @db.Timestamptz
+  updatedAt            DateTime     @updatedAt @db.Timestamptz
+  deletedAt            DateTime?    @db.Timestamptz
+
+  homeBranch    Branch      @relation(fields: [homeBranchId], references: [id])
+  user          User?       @relation("MemberLogin", fields: [userId], references: [id])
+  photoFile     FileObject? @relation("MemberPhoto", fields: [photoFileId], references: [id])
+  createdBy     User        @relation("MemberCreatedBy", fields: [createdById], references: [id])
+  convertedFrom Lead?       @relation("LeadConversion", fields: [convertedFromLeadId], references: [id])
+
+  subscriptions      Subscription[]
+  invoices           Invoice[]
+  attendance         Attendance[]
+  healthRecords      HealthDeclaration[]
+  consents           ConsentRecord[]
+  documents          MemberDocument[]
+  notes              MemberNote[]
+  trainerAssignments TrainerAssignment[]
+  workoutPlans       WorkoutPlan[]
+  dietPlans          DietPlan[]
+  ptPackages         MemberPtPackage[]
+  ptSessions         PtSession[]
+  transfers          MemberBranchTransfer[]
+  bodyMetrics        BodyMetric[]
+  notifications      NotificationLog[]
+  referralsMade      Lead[]                 @relation("LeadReferrer")
+  trials             Trial[]
+  dataRequests       DataSubjectRequest[]
+
+  @@index([phone])
+  @@index([homeBranchId, status])
+  @@index([lastName, firstName])
+}
+
+model MemberBranchTransfer {
+  id              String   @id @default(uuid()) @db.Uuid
+  memberId        String   @db.Uuid
+  fromBranchId    String   @db.Uuid
+  toBranchId      String   @db.Uuid
+  reason          String?
+  transferredById String   @db.Uuid
+  transferredAt   DateTime @default(now()) @db.Timestamptz
+
+  member        Member @relation(fields: [memberId], references: [id])
+  fromBranch    Branch @relation("TransferFrom", fields: [fromBranchId], references: [id])
+  toBranch      Branch @relation("TransferTo", fields: [toBranchId], references: [id])
+  transferredBy User   @relation(fields: [transferredById], references: [id])
+
+  @@index([memberId])
+}
+
+/// Health declaration — sensitive. Free-text fields encrypted at application level (AES-256-GCM, KMS data key).
+/// Read access requires "members.health.read" and is logged in HealthRecordAccess.
+model HealthDeclaration {
+  id                    String    @id @default(uuid()) @db.Uuid
+  memberId              String    @db.Uuid
+  consentRecordId       String    @db.Uuid // must reference a HEALTH_DATA_PROCESSING consent
+  formVersion           String
+  hasMedicalCondition   Boolean
+  parqAnswersEncrypted  Bytes // JSON of PAR-Q style answers
+  conditionsEncrypted   Bytes?
+  medicationsEncrypted  Bytes?
+  doctorClearanceFileId String?   @db.Uuid
+  declaredAt            DateTime  @default(now()) @db.Timestamptz
+  supersededAt          DateTime? @db.Timestamptz
+
+  member   Member               @relation(fields: [memberId], references: [id])
+  consent  ConsentRecord        @relation(fields: [consentRecordId], references: [id])
+  accesses HealthRecordAccess[]
+
+  @@index([memberId, supersededAt])
+}
+
+model HealthRecordAccess {
+  id                  String   @id @default(uuid()) @db.Uuid
+  healthDeclarationId String   @db.Uuid
+  userId              String   @db.Uuid
+  purpose             String
+  accessedAt          DateTime @default(now()) @db.Timestamptz
+
+  healthDeclaration HealthDeclaration @relation(fields: [healthDeclarationId], references: [id])
+  user              User              @relation(fields: [userId], references: [id])
+}
+
+/// Append-only consent ledger (DPDP). Withdrawal = new row with granted=false.
+model ConsentRecord {
+  id             String         @id @default(uuid()) @db.Uuid
+  memberId       String         @db.Uuid
+  purpose        ConsentPurpose
+  granted        Boolean
+  noticeVersion  String // version of the privacy notice / consent text shown
+  channel        String // "front_desk_tablet", "member_portal", "paper_scanned"
+  evidenceFileId String?        @db.Uuid
+  recordedById   String?        @db.Uuid
+  ipAddress      String?        @db.Inet
+  recordedAt     DateTime       @default(now()) @db.Timestamptz
+
+  member        Member              @relation(fields: [memberId], references: [id])
+  recordedBy    User?               @relation("ConsentRecordedBy", fields: [recordedById], references: [id])
+  healthRecords HealthDeclaration[]
+
+  @@index([memberId, purpose, recordedAt])
+}
+
+model MemberDocument {
+  id        String    @id @default(uuid()) @db.Uuid
+  memberId  String    @db.Uuid
+  fileId    String    @db.Uuid
+  docType   String // "ID_PROOF", "MEDICAL_CLEARANCE", "WAIVER", "OTHER"
+  label     String?
+  createdAt DateTime  @default(now()) @db.Timestamptz
+  deletedAt DateTime? @db.Timestamptz
+
+  member Member     @relation(fields: [memberId], references: [id])
+  file   FileObject @relation(fields: [fileId], references: [id])
+}
+
+model MemberNote {
+  id        String   @id @default(uuid()) @db.Uuid
+  memberId  String   @db.Uuid
+  authorId  String   @db.Uuid
+  body      String
+  isPinned  Boolean  @default(false)
+  createdAt DateTime @default(now()) @db.Timestamptz
+
+  member Member @relation(fields: [memberId], references: [id])
+  author User   @relation(fields: [authorId], references: [id])
+}
+
+model BodyMetric {
+  id           String   @id @default(uuid()) @db.Uuid
+  memberId     String   @db.Uuid
+  recordedById String?  @db.Uuid
+  measuredOn   DateTime @db.Date
+  weightGrams  Int?
+  heightMm     Int?
+  bodyFatBp    Int? // basis points
+  chestMm      Int?
+  waistMm      Int?
+  hipMm        Int?
+  notes        String?
+  createdAt    DateTime @default(now()) @db.Timestamptz
+
+  member Member @relation(fields: [memberId], references: [id])
+
+  @@index([memberId, measuredOn])
+}
+
+// -----------------------------------------------------------------------------
+// Membership plans & subscriptions
+// -----------------------------------------------------------------------------
+
+model MembershipPlan {
+  id                   String       @id @default(uuid()) @db.Uuid
+  name                 String
+  description          String?
+  durationDays         Int
+  pricePaise           Int // selling price, exclusive of GST
+  registrationFeePaise Int          @default(0)
+  taxRateBp            Int          @default(1800)
+  sacCode              String       @default("999723") @db.VarChar(8) // verify with client's CA
+  maxDiscountPaise     Int          @default(0) // cap on discretionary discount by staff
+  freezeAllowed        Boolean      @default(false)
+  maxFreezeDays        Int          @default(0)
+  maxFreezeCount       Int          @default(0)
+  allBranchAccess      Boolean      @default(false) // false = only branches listed in MembershipPlanBranch
+  accessStartTime      String?      @db.VarChar(5) // "06:00" — null = branch hours
+  accessEndTime        String?      @db.VarChar(5)
+  facilities           String[]     @default([]) // ["GYM_FLOOR", "CARDIO", "STEAM"]
+  status               RecordStatus @default(ACTIVE)
+  createdAt            DateTime     @default(now()) @db.Timestamptz
+  updatedAt            DateTime     @updatedAt @db.Timestamptz
+
+  branches      MembershipPlanBranch[]
+  subscriptions Subscription[]
+  leads         Lead[]
+}
+
+model MembershipPlanBranch {
+  planId   String @db.Uuid
+  branchId String @db.Uuid
+
+  plan   MembershipPlan @relation(fields: [planId], references: [id], onDelete: Cascade)
+  branch Branch         @relation(fields: [branchId], references: [id])
+
+  @@id([planId, branchId])
+}
+
+/// One row per purchase. Renewals create new rows; history is never overwritten.
+/// Plan terms are snapshotted so later plan edits don't change past subscriptions.
+model Subscription {
+  id                     String             @id @default(uuid()) @db.Uuid
+  memberId               String             @db.Uuid
+  planId                 String             @db.Uuid
+  invoiceId              String?            @unique @db.Uuid
+  previousSubscriptionId String?            @unique @db.Uuid // renewal chain
+  status                 SubscriptionStatus @default(PENDING_PAYMENT)
+  startDate              DateTime           @db.Date
+  endDate                DateTime           @db.Date // inclusive; extended by freezes/closures
+  originalEndDate        DateTime           @db.Date
+  planSnapshot           Json // name, durationDays, price, access rules, freeze rules at purchase time
+  activatedAt            DateTime?          @db.Timestamptz
+  cancelledAt            DateTime?          @db.Timestamptz
+  cancelReason           String?
+  createdAt              DateTime           @default(now()) @db.Timestamptz
+  updatedAt              DateTime           @updatedAt @db.Timestamptz
+
+  member     Member                  @relation(fields: [memberId], references: [id])
+  plan       MembershipPlan          @relation(fields: [planId], references: [id])
+  invoice    Invoice?                @relation(fields: [invoiceId], references: [id])
+  previous   Subscription?           @relation("RenewalChain", fields: [previousSubscriptionId], references: [id])
+  next       Subscription?           @relation("RenewalChain")
+  freezes    SubscriptionFreeze[]
+  extensions SubscriptionExtension[]
+
+  @@index([memberId, status])
+  @@index([endDate, status]) // expiry jobs & reminders
+}
+
+model SubscriptionFreeze {
+  id             String    @id @default(uuid()) @db.Uuid
+  subscriptionId String    @db.Uuid
+  startDate      DateTime  @db.Date
+  endDate        DateTime  @db.Date
+  reason         String?
+  approvedById   String    @db.Uuid
+  endedEarlyOn   DateTime? @db.Date
+  createdAt      DateTime  @default(now()) @db.Timestamptz
+
+  subscription Subscription @relation(fields: [subscriptionId], references: [id])
+  approvedBy   User         @relation(fields: [approvedById], references: [id])
+}
+
+/// Any change to endDate other than a freeze (branch closure, goodwill, correction).
+model SubscriptionExtension {
+  id              String   @id @default(uuid()) @db.Uuid
+  subscriptionId  String   @db.Uuid
+  days            Int
+  reason          String
+  branchClosureId String?  @db.Uuid
+  createdById     String   @db.Uuid
+  createdAt       DateTime @default(now()) @db.Timestamptz
+
+  subscription Subscription @relation(fields: [subscriptionId], references: [id])
+}
+
+// -----------------------------------------------------------------------------
+// Leads & trials
+// -----------------------------------------------------------------------------
+
+model Lead {
+  id                 String       @id @default(uuid()) @db.Uuid
+  branchId           String       @db.Uuid
+  name               String
+  phone              String       @db.VarChar(15)
+  email              String?
+  source             LeadSource
+  sourceDetail       String? // campaign name, ad id …
+  referredByMemberId String?      @db.Uuid
+  interestedPlanId   String?      @db.Uuid
+  stage              LeadStage    @default(NEW)
+  priority           LeadPriority @default(MEDIUM)
+  assignedToId       String?      @db.Uuid
+  nextFollowUpAt     DateTime?    @db.Timestamptz
+  lostReason         String?
+  duplicateOfId      String?      @db.Uuid
+  createdAt          DateTime     @default(now()) @db.Timestamptz
+  updatedAt          DateTime     @updatedAt @db.Timestamptz
+  convertedAt        DateTime?    @db.Timestamptz
+  deletedAt          DateTime?    @db.Timestamptz
+
+  branch         Branch          @relation(fields: [branchId], references: [id])
+  assignedTo     User?           @relation("LeadAssignee", fields: [assignedToId], references: [id])
+  referredBy     Member?         @relation("LeadReferrer", fields: [referredByMemberId], references: [id])
+  duplicateOf    Lead?           @relation("LeadDuplicate", fields: [duplicateOfId], references: [id])
+  duplicates     Lead[]          @relation("LeadDuplicate")
+  activities     LeadActivity[]
+  trials         Trial[]
+  member         Member?         @relation("LeadConversion")
+  interestedPlan MembershipPlan? @relation(fields: [interestedPlanId], references: [id])
+
+  @@index([phone])
+  @@index([branchId, stage])
+  @@index([assignedToId, nextFollowUpAt])
+}
+
+model LeadActivity {
+  id         String           @id @default(uuid()) @db.Uuid
+  leadId     String           @db.Uuid
+  userId     String           @db.Uuid
+  type       LeadActivityType
+  notes      String?
+  fromStage  LeadStage?
+  toStage    LeadStage?
+  occurredAt DateTime         @default(now()) @db.Timestamptz
+
+  lead Lead @relation(fields: [leadId], references: [id])
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([leadId, occurredAt])
+}
+
+model Trial {
+  id          String      @id @default(uuid()) @db.Uuid
+  leadId      String?     @db.Uuid
+  memberId    String?     @db.Uuid
+  scheduledAt DateTime    @db.Timestamptz
+  trainerId   String?     @db.Uuid
+  status      TrialStatus @default(SCHEDULED)
+  feedback    String?
+  createdAt   DateTime    @default(now()) @db.Timestamptz
+
+  lead    Lead?   @relation(fields: [leadId], references: [id])
+  member  Member? @relation(fields: [memberId], references: [id])
+  trainer Staff?  @relation(fields: [trainerId], references: [id])
+
+  @@index([scheduledAt])
+}
+
+// -----------------------------------------------------------------------------
+// Attendance & access devices
+// -----------------------------------------------------------------------------
+
+model Device {
+  id         String       @id @default(uuid()) @db.Uuid
+  branchId   String       @db.Uuid
+  name       String // "Front desk tablet", "Turnstile 1"
+  kind       String // KIOSK | TURNSTILE | RFID_READER | BIOMETRIC
+  apiKeyHash String       @unique @db.VarChar(64) // device credential, rotatable
+  status     RecordStatus @default(ACTIVE)
+  lastSeenAt DateTime?    @db.Timestamptz
+  createdAt  DateTime     @default(now()) @db.Timestamptz
+
+  branch     Branch       @relation(fields: [branchId], references: [id])
+  attendance Attendance[]
+}
+
+/// Every check-in attempt is recorded, including denials.
+model Attendance {
+  id             String                @id @default(uuid()) @db.Uuid
+  memberId       String?               @db.Uuid // null when lookup failed
+  branchId       String                @db.Uuid
+  deviceId       String?               @db.Uuid
+  operatorId     String?               @db.Uuid // staff user for manual / phone lookup
+  subscriptionId String?               @db.Uuid
+  method         AttendanceMethod
+  result         AttendanceResult
+  denyReason     AttendanceDenyReason?
+  overrideReason String? // staff override of a denial
+  checkInAt      DateTime              @db.Timestamptz
+  checkOutAt     DateTime?             @db.Timestamptz
+  clientEventId  String?               @unique // offline-queued kiosk events dedupe on this
+  createdAt      DateTime              @default(now()) @db.Timestamptz
+
+  member   Member? @relation(fields: [memberId], references: [id])
+  branch   Branch  @relation(fields: [branchId], references: [id])
+  device   Device? @relation(fields: [deviceId], references: [id])
+  operator User?   @relation("AttendanceOperator", fields: [operatorId], references: [id])
+
+  @@index([branchId, checkInAt])
+  @@index([memberId, checkInAt])
+}
+
+// -----------------------------------------------------------------------------
+// Staff, trainers, payroll
+// -----------------------------------------------------------------------------
+
+model Staff {
+  id                   String           @id @default(uuid()) @db.Uuid
+  userId               String           @unique @db.Uuid
+  employeeCode         String           @unique @db.VarChar(20)
+  branchId             String           @db.Uuid // primary branch
+  designation          String
+  isTrainer            Boolean          @default(false)
+  specializations      String[]         @default([])
+  qualifications       String[]         @default([])
+  joinedOn             DateTime         @db.Date
+  exitedOn             DateTime?        @db.Date
+  employmentStatus     EmploymentStatus @default(ACTIVE)
+  monthlySalaryPaise   Int              @default(0)
+  ptCommissionBp       Int              @default(0) // % of PT revenue as commission
+  bankAccountEncrypted Bytes?
+  panEncrypted         Bytes?
+  createdAt            DateTime         @default(now()) @db.Timestamptz
+  updatedAt            DateTime         @updatedAt @db.Timestamptz
+
+  user            User                  @relation(fields: [userId], references: [id])
+  branch          Branch                @relation(fields: [branchId], references: [id])
+  assignments     TrainerAssignment[]
+  availability    TrainerAvailability[]
+  workoutPlans    WorkoutPlan[]
+  dietPlans       DietPlan[]
+  ptSessions      PtSession[]
+  trials          Trial[]
+  shifts          StaffShift[]
+  staffAttendance StaffAttendance[]
+  leaveRequests   LeaveRequest[]
+  salaryAdvances  SalaryAdvance[]
+  payslips        Payslip[]
+  soldPtPackages  MemberPtPackage[]
+
+  @@index([branchId, employmentStatus])
+}
+
+/// History of trainer ↔ member assignment. Active assignment has endedAt NULL.
+model TrainerAssignment {
+  id        String    @id @default(uuid()) @db.Uuid
+  memberId  String    @db.Uuid
+  trainerId String    @db.Uuid
+  startedAt DateTime  @default(now()) @db.Timestamptz
+  endedAt   DateTime? @db.Timestamptz
+  endReason String?
+
+  member  Member @relation(fields: [memberId], references: [id])
+  trainer Staff  @relation(fields: [trainerId], references: [id])
+
+  @@index([trainerId, endedAt])
+  @@index([memberId, endedAt])
+}
+
+model TrainerAvailability {
+  id        String @id @default(uuid()) @db.Uuid
+  trainerId String @db.Uuid
+  dayOfWeek Int
+  startTime String @db.VarChar(5)
+  endTime   String @db.VarChar(5)
+
+  trainer Staff @relation(fields: [trainerId], references: [id], onDelete: Cascade)
+}
+
+model StaffShift {
+  id        String   @id @default(uuid()) @db.Uuid
+  staffId   String   @db.Uuid
+  date      DateTime @db.Date
+  startTime String   @db.VarChar(5)
+  endTime   String   @db.VarChar(5)
+
+  staff Staff @relation(fields: [staffId], references: [id])
+
+  @@unique([staffId, date, startTime])
+}
+
+model StaffAttendance {
+  id         String    @id @default(uuid()) @db.Uuid
+  staffId    String    @db.Uuid
+  date       DateTime  @db.Date
+  clockInAt  DateTime? @db.Timestamptz
+  clockOutAt DateTime? @db.Timestamptz
+  status     String // PRESENT | ABSENT | HALF_DAY | LEAVE | HOLIDAY
+
+  staff Staff @relation(fields: [staffId], references: [id])
+
+  @@unique([staffId, date])
+}
+
+model LeaveRequest {
+  id         String      @id @default(uuid()) @db.Uuid
+  staffId    String      @db.Uuid
+  startDate  DateTime    @db.Date
+  endDate    DateTime    @db.Date
+  leaveType  String // CASUAL | SICK | UNPAID
+  reason     String?
+  status     LeaveStatus @default(PENDING)
+  approverId String?     @db.Uuid
+  decidedAt  DateTime?   @db.Timestamptz
+  createdAt  DateTime    @default(now()) @db.Timestamptz
+
+  staff    Staff @relation(fields: [staffId], references: [id])
+  approver User? @relation("LeaveApprover", fields: [approverId], references: [id])
+}
+
+model SalaryAdvance {
+  id                   String   @id @default(uuid()) @db.Uuid
+  staffId              String   @db.Uuid
+  amountPaise          Int
+  givenOn              DateTime @db.Date
+  recoveredInPayslipId String?  @db.Uuid
+  notes                String?
+  createdAt            DateTime @default(now()) @db.Timestamptz
+
+  staff Staff @relation(fields: [staffId], references: [id])
+}
+
+model PayrollRun {
+  id          String        @id @default(uuid()) @db.Uuid
+  periodStart DateTime      @db.Date
+  periodEnd   DateTime      @db.Date
+  status      PayrollStatus @default(DRAFT)
+  createdById String        @db.Uuid
+  finalizedAt DateTime?     @db.Timestamptz
+  createdAt   DateTime      @default(now()) @db.Timestamptz
+
+  createdBy User      @relation(fields: [createdById], references: [id])
+  payslips  Payslip[]
+
+  @@unique([periodStart, periodEnd])
+}
+
+model Payslip {
+  id              String   @id @default(uuid()) @db.Uuid
+  payrollRunId    String   @db.Uuid
+  staffId         String   @db.Uuid
+  basePaise       Int
+  commissionPaise Int      @default(0)
+  incentivePaise  Int      @default(0)
+  deductionsPaise Int      @default(0) // LOP, advances, PF/ESI/PT as configured
+  netPaise        Int
+  breakdown       Json // line items
+  pdfFileId       String?  @db.Uuid
+  createdAt       DateTime @default(now()) @db.Timestamptz
+
+  payrollRun PayrollRun  @relation(fields: [payrollRunId], references: [id])
+  staff      Staff       @relation(fields: [staffId], references: [id])
+  pdfFile    FileObject? @relation(fields: [pdfFileId], references: [id])
+
+  @@unique([payrollRunId, staffId])
+}
+
+// -----------------------------------------------------------------------------
+// Workouts, diet, personal training
+// -----------------------------------------------------------------------------
+
+model Exercise {
+  id           String       @id @default(uuid()) @db.Uuid
+  name         String       @unique
+  muscleGroup  String
+  equipment    String?
+  instructions String?
+  videoUrl     String?
+  status       RecordStatus @default(ACTIVE)
+
+  planItems WorkoutPlanExercise[]
+}
+
+model WorkoutPlan {
+  id        String    @id @default(uuid()) @db.Uuid
+  memberId  String    @db.Uuid
+  trainerId String    @db.Uuid
+  name      String
+  goal      String // FAT_LOSS | MUSCLE_GAIN | STRENGTH | ENDURANCE | GENERAL
+  startDate DateTime  @db.Date
+  endDate   DateTime? @db.Date
+  isActive  Boolean   @default(true)
+  notes     String?
+  createdAt DateTime  @default(now()) @db.Timestamptz
+  updatedAt DateTime  @updatedAt @db.Timestamptz
+
+  member    Member                @relation(fields: [memberId], references: [id])
+  trainer   Staff                 @relation(fields: [trainerId], references: [id])
+  exercises WorkoutPlanExercise[]
+
+  @@index([memberId, isActive])
+}
+
+model WorkoutPlanExercise {
+  id            String   @id @default(uuid()) @db.Uuid
+  workoutPlanId String   @db.Uuid
+  exerciseId    String   @db.Uuid
+  dayOfWeek     Int? // null = every session
+  dayLabel      String? // "Day A — Push"
+  sortOrder     Int
+  sets          Int
+  reps          String   @db.VarChar(20) // "8-12" or "AMRAP"
+  weightKg      Decimal? @db.Decimal(6, 2)
+  restSeconds   Int?
+  notes         String?
+
+  workoutPlan WorkoutPlan @relation(fields: [workoutPlanId], references: [id], onDelete: Cascade)
+  exercise    Exercise    @relation(fields: [exerciseId], references: [id])
+}
+
+model DietPlan {
+  id            String   @id @default(uuid()) @db.Uuid
+  memberId      String   @db.Uuid
+  trainerId     String   @db.Uuid
+  name          String
+  dailyCalories Int?
+  proteinG      Int?
+  carbsG        Int?
+  fatG          Int?
+  preferences   String[] @default([]) // "VEG", "EGGETARIAN", "JAIN", "NON_VEG"
+  allergies     String[] @default([])
+  isActive      Boolean  @default(true)
+  startDate     DateTime @db.Date
+  notes         String?
+  createdAt     DateTime @default(now()) @db.Timestamptz
+  updatedAt     DateTime @updatedAt @db.Timestamptz
+
+  member  Member     @relation(fields: [memberId], references: [id])
+  trainer Staff      @relation(fields: [trainerId], references: [id])
+  meals   DietMeal[]
+}
+
+model DietMeal {
+  id         String @id @default(uuid()) @db.Uuid
+  dietPlanId String @db.Uuid
+  mealTime   String @db.VarChar(5) // "07:30"
+  label      String // "Breakfast"
+  items      Json // [{ food, portion, calories, proteinG, carbsG, fatG }]
+  sortOrder  Int
+
+  dietPlan DietPlan @relation(fields: [dietPlanId], references: [id], onDelete: Cascade)
+}
+
+model PtPackage {
+  id           String       @id @default(uuid()) @db.Uuid
+  name         String
+  sessionCount Int
+  validityDays Int
+  pricePaise   Int
+  taxRateBp    Int          @default(1800)
+  status       RecordStatus @default(ACTIVE)
+  createdAt    DateTime     @default(now()) @db.Timestamptz
+
+  sold MemberPtPackage[]
+}
+
+model MemberPtPackage {
+  id            String   @id @default(uuid()) @db.Uuid
+  memberId      String   @db.Uuid
+  ptPackageId   String   @db.Uuid
+  trainerId     String   @db.Uuid
+  invoiceId     String?  @unique @db.Uuid
+  sessionsTotal Int
+  sessionsUsed  Int      @default(0)
+  validFrom     DateTime @db.Date
+  validUntil    DateTime @db.Date
+  status        String   @default("PENDING_PAYMENT") // PENDING_PAYMENT | ACTIVE | EXHAUSTED | EXPIRED | CANCELLED
+  createdAt     DateTime @default(now()) @db.Timestamptz
+
+  member    Member      @relation(fields: [memberId], references: [id])
+  ptPackage PtPackage   @relation(fields: [ptPackageId], references: [id])
+  trainer   Staff       @relation(fields: [trainerId], references: [id])
+  invoice   Invoice?    @relation(fields: [invoiceId], references: [id])
+  sessions  PtSession[]
+}
+
+model PtSession {
+  id                   String          @id @default(uuid()) @db.Uuid
+  memberPtPackageId    String          @db.Uuid
+  memberId             String          @db.Uuid
+  trainerId            String          @db.Uuid
+  branchId             String          @db.Uuid
+  scheduledStart       DateTime        @db.Timestamptz
+  scheduledEnd         DateTime        @db.Timestamptz
+  status               PtSessionStatus @default(SCHEDULED)
+  countsAgainstPackage Boolean         @default(true) // false for cancellations within policy
+  trainerNotes         String?
+  completedAt          DateTime?       @db.Timestamptz
+  createdAt            DateTime        @default(now()) @db.Timestamptz
+
+  memberPtPackage MemberPtPackage @relation(fields: [memberPtPackageId], references: [id])
+  member          Member          @relation(fields: [memberId], references: [id])
+  trainer         Staff           @relation(fields: [trainerId], references: [id])
+  branch          Branch          @relation(fields: [branchId], references: [id])
+
+  @@index([trainerId, scheduledStart])
+  @@index([memberId, scheduledStart])
+}
+
+// -----------------------------------------------------------------------------
+// Billing: invoices, payments, allocations, refunds, gateway
+// -----------------------------------------------------------------------------
+
+/// GST requires a unique, consecutive series per financial year. One counter per branch per FY.
+model InvoiceSequence {
+  branchId      String @db.Uuid
+  financialYear String @db.VarChar(7) // "2026-27"
+  prefix        String // "CBEA/26-27/"
+  nextNumber    Int    @default(1)
+
+  branch Branch @relation(fields: [branchId], references: [id])
+
+  @@id([branchId, financialYear])
+}
+
+model Invoice {
+  id                     String        @id @default(uuid()) @db.Uuid
+  invoiceNumber          String?       @unique // assigned on ISSUE, not on DRAFT
+  branchId               String        @db.Uuid
+  memberId               String        @db.Uuid
+  status                 InvoiceStatus @default(DRAFT)
+  issueDate              DateTime?     @db.Date
+  dueDate                DateTime?     @db.Date
+  placeOfSupplyStateCode String        @db.VarChar(2)
+  subtotalPaise          Int // sum of item taxable values (after item discounts)
+  discountPaise          Int           @default(0) // invoice-level discount (coupon)
+  cgstPaise              Int           @default(0)
+  sgstPaise              Int           @default(0)
+  igstPaise              Int           @default(0)
+  roundOffPaise          Int           @default(0)
+  totalPaise             Int
+  couponId               String?       @db.Uuid
+  notes                  String?
+  pdfFileId              String?       @db.Uuid
+  createdById            String        @db.Uuid
+  voidedAt               DateTime?     @db.Timestamptz
+  voidReason             String?
+  createdAt              DateTime      @default(now()) @db.Timestamptz
+  updatedAt              DateTime      @updatedAt @db.Timestamptz
+
+  branch        Branch              @relation(fields: [branchId], references: [id])
+  member        Member              @relation(fields: [memberId], references: [id])
+  createdBy     User                @relation("InvoiceCreatedBy", fields: [createdById], references: [id])
+  coupon        Coupon?             @relation(fields: [couponId], references: [id])
+  pdfFile       FileObject?         @relation("InvoicePdf", fields: [pdfFileId], references: [id])
+  items         InvoiceItem[]
+  allocations   PaymentAllocation[]
+  gatewayOrders GatewayOrder[]
+  subscription  Subscription?
+  ptPackage     MemberPtPackage?
+  creditNotes   CreditNote[]
+
+  @@index([memberId, status])
+  @@index([branchId, issueDate])
+}
+
+model InvoiceItem {
+  id                String          @id @default(uuid()) @db.Uuid
+  invoiceId         String          @db.Uuid
+  itemType          InvoiceItemType
+  description       String
+  sacOrHsn          String?         @db.VarChar(8)
+  quantity          Int             @default(1)
+  unitPricePaise    Int
+  discountPaise     Int             @default(0)
+  taxableValuePaise Int // quantity * unit - discount
+  taxRateBp         Int
+  taxPaise          Int
+  totalPaise        Int
+  productId         String?         @db.Uuid
+  sortOrder         Int             @default(0)
+
+  invoice Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  product Product? @relation(fields: [productId], references: [id])
+}
+
+/// Money received. Immutable once CONFIRMED; corrections via Refund or reversal entries.
+model Payment {
+  id               String        @id @default(uuid()) @db.Uuid
+  receiptNumber    String        @unique
+  branchId         String        @db.Uuid
+  memberId         String        @db.Uuid
+  method           PaymentMethod
+  status           PaymentStatus @default(PENDING)
+  amountPaise      Int
+  unallocatedPaise Int           @default(0) // advance / credit balance
+  referenceNumber  String? // UPI ref, cheque no, bank UTR
+  gatewayOrderId   String?       @db.Uuid
+  gatewayPaymentId String?       @unique // Razorpay pay_xxx — uniqueness blocks double-processing
+  receivedById     String?       @db.Uuid
+  receivedAt       DateTime      @db.Timestamptz
+  failureReason    String?
+  createdAt        DateTime      @default(now()) @db.Timestamptz
+
+  branch       Branch              @relation(fields: [branchId], references: [id])
+  receivedBy   User?               @relation("PaymentReceivedBy", fields: [receivedById], references: [id])
+  gatewayOrder GatewayOrder?       @relation(fields: [gatewayOrderId], references: [id])
+  allocations  PaymentAllocation[]
+  refunds      Refund[]
+
+  @@index([memberId, receivedAt])
+  @@index([branchId, receivedAt, method]) // daily collection report
+}
+
+/// Links money to invoices (supports partial payments and one payment across invoices).
+model PaymentAllocation {
+  id          String   @id @default(uuid()) @db.Uuid
+  paymentId   String   @db.Uuid
+  invoiceId   String   @db.Uuid
+  amountPaise Int
+  createdAt   DateTime @default(now()) @db.Timestamptz
+
+  payment Payment @relation(fields: [paymentId], references: [id])
+  invoice Invoice @relation(fields: [invoiceId], references: [id])
+
+  @@index([invoiceId])
+}
+
+model Refund {
+  id              String        @id @default(uuid()) @db.Uuid
+  paymentId       String        @db.Uuid
+  amountPaise     Int
+  reason          String
+  status          RefundStatus  @default(REQUESTED)
+  method          PaymentMethod
+  gatewayRefundId String?       @unique
+  creditNoteId    String?       @unique @db.Uuid
+  requestedById   String        @db.Uuid
+  approvedById    String?       @db.Uuid
+  processedAt     DateTime?     @db.Timestamptz
+  createdAt       DateTime      @default(now()) @db.Timestamptz
+
+  payment     Payment     @relation(fields: [paymentId], references: [id])
+  requestedBy User        @relation("RefundRequestedBy", fields: [requestedById], references: [id])
+  approvedBy  User?       @relation("RefundApprovedBy", fields: [approvedById], references: [id])
+  creditNote  CreditNote? @relation(fields: [creditNoteId], references: [id])
+}
+
+/// GST credit note against an issued invoice (cancellations, refunds, price corrections).
+model CreditNote {
+  id           String   @id @default(uuid()) @db.Uuid
+  noteNumber   String   @unique
+  invoiceId    String   @db.Uuid
+  reason       String
+  taxablePaise Int
+  cgstPaise    Int      @default(0)
+  sgstPaise    Int      @default(0)
+  igstPaise    Int      @default(0)
+  totalPaise   Int
+  issuedAt     DateTime @default(now()) @db.Timestamptz
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id])
+  refund  Refund?
+}
+
+/// Razorpay order created by the backend. The amount here is the source of truth when verifying.
+model GatewayOrder {
+  id              String             @id @default(uuid()) @db.Uuid
+  provider        String             @default("RAZORPAY")
+  providerOrderId String             @unique // order_xxx
+  invoiceId       String             @db.Uuid
+  amountPaise     Int
+  currency        String             @default("INR") @db.VarChar(3)
+  status          GatewayOrderStatus @default(CREATED)
+  createdAt       DateTime           @default(now()) @db.Timestamptz
+  expiresAt       DateTime           @db.Timestamptz
+
+  invoice  Invoice   @relation(fields: [invoiceId], references: [id])
+  payments Payment[]
+}
+
+/// Raw webhook inbox. Unique event id makes processing exactly-once.
+model WebhookEvent {
+  id              String    @id @default(uuid()) @db.Uuid
+  provider        String
+  providerEventId String
+  eventType       String
+  signatureValid  Boolean
+  payload         Json
+  receivedAt      DateTime  @default(now()) @db.Timestamptz
+  processedAt     DateTime? @db.Timestamptz
+  processingError String?
+  attempts        Int       @default(0)
+
+  @@unique([provider, providerEventId])
+  @@index([processedAt])
+}
+
+model Coupon {
+  id               String            @id @default(uuid()) @db.Uuid
+  code             String            @unique
+  description      String?
+  percentBp        Int? // either percent or flat
+  flatPaise        Int?
+  maxDiscountPaise Int?
+  validFrom        DateTime          @db.Date
+  validUntil       DateTime          @db.Date
+  maxUses          Int?
+  usedCount        Int               @default(0)
+  appliesTo        InvoiceItemType[] @default([])
+  status           RecordStatus      @default(ACTIVE)
+
+  invoices Invoice[]
+}
+
+// -----------------------------------------------------------------------------
+// Expenses
+// -----------------------------------------------------------------------------
+
+model ExpenseCategory {
+  id     String       @id @default(uuid()) @db.Uuid
+  name   String       @unique // Rent, Salary, Electricity, Equipment, Maintenance, Marketing, Utilities, Other
+  status RecordStatus @default(ACTIVE)
+
+  expenses Expense[]
+}
+
+model Expense {
+  id              String        @id @default(uuid()) @db.Uuid
+  branchId        String        @db.Uuid
+  categoryId      String        @db.Uuid
+  vendorId        String?       @db.Uuid
+  description     String
+  amountPaise     Int
+  gstPaise        Int           @default(0) // input GST, if claimable
+  expenseDate     DateTime      @db.Date
+  paymentMethod   PaymentMethod
+  referenceNumber String?
+  receiptFileId   String?       @db.Uuid
+  createdById     String        @db.Uuid
+  createdAt       DateTime      @default(now()) @db.Timestamptz
+  deletedAt       DateTime?     @db.Timestamptz
+
+  branch      Branch          @relation(fields: [branchId], references: [id])
+  category    ExpenseCategory @relation(fields: [categoryId], references: [id])
+  vendor      Vendor?         @relation(fields: [vendorId], references: [id])
+  receiptFile FileObject?     @relation("ExpenseReceipt", fields: [receiptFileId], references: [id])
+  createdBy   User            @relation("ExpenseCreatedBy", fields: [createdById], references: [id])
+
+  @@index([branchId, expenseDate])
+}
+
+// -----------------------------------------------------------------------------
+// Equipment & inventory
+// -----------------------------------------------------------------------------
+
+model Vendor {
+  id        String       @id @default(uuid()) @db.Uuid
+  name      String
+  phone     String?
+  email     String?
+  gstin     String?      @db.VarChar(15)
+  address   String?
+  status    RecordStatus @default(ACTIVE)
+  createdAt DateTime     @default(now()) @db.Timestamptz
+
+  equipment Equipment[]
+  expenses  Expense[]
+  stock     StockMovement[]
+}
+
+model Equipment {
+  id                  String             @id @default(uuid()) @db.Uuid
+  assetTag            String             @unique
+  branchId            String             @db.Uuid
+  name                String
+  category            String // CARDIO | STRENGTH | FREE_WEIGHTS | ACCESSORY
+  brand               String?
+  serialNumber        String?
+  vendorId            String?            @db.Uuid
+  purchaseDate        DateTime?          @db.Date
+  purchasePricePaise  Int?
+  warrantyUntil       DateTime?          @db.Date
+  serviceIntervalDays Int?
+  nextServiceDue      DateTime?          @db.Date
+  condition           EquipmentCondition @default(GOOD)
+  createdAt           DateTime           @default(now()) @db.Timestamptz
+  updatedAt           DateTime           @updatedAt @db.Timestamptz
+
+  branch      Branch           @relation(fields: [branchId], references: [id])
+  vendor      Vendor?          @relation(fields: [vendorId], references: [id])
+  maintenance MaintenanceLog[]
+
+  @@index([branchId, nextServiceDue])
+}
+
+model MaintenanceLog {
+  id             String             @id @default(uuid()) @db.Uuid
+  equipmentId    String             @db.Uuid
+  kind           String // SCHEDULED_SERVICE | REPAIR | INSPECTION
+  description    String
+  costPaise      Int                @default(0)
+  performedOn    DateTime           @db.Date
+  performedBy    String? // technician / vendor
+  loggedById     String             @db.Uuid
+  conditionAfter EquipmentCondition
+  createdAt      DateTime           @default(now()) @db.Timestamptz
+
+  equipment Equipment @relation(fields: [equipmentId], references: [id])
+  loggedBy  User      @relation(fields: [loggedById], references: [id])
+}
+
+/// Sellable goods: supplements, merchandise, consumables.
+model Product {
+  id                String       @id @default(uuid()) @db.Uuid
+  sku               String       @unique
+  name              String
+  hsnCode           String?      @db.VarChar(8)
+  sellingPricePaise Int
+  taxRateBp         Int          @default(1800)
+  reorderLevel      Int          @default(0)
+  status            RecordStatus @default(ACTIVE)
+  createdAt         DateTime     @default(now()) @db.Timestamptz
+
+  movements    StockMovement[]
+  invoiceItems InvoiceItem[]
+}
+
+/// Ledger of stock changes; on-hand quantity = SUM(quantity) per product+branch (see view in constraints.sql).
+model StockMovement {
+  id            String            @id @default(uuid()) @db.Uuid
+  productId     String            @db.Uuid
+  branchId      String            @db.Uuid
+  type          StockMovementType
+  quantity      Int // signed: +in / -out
+  unitCostPaise Int?
+  vendorId      String?           @db.Uuid
+  invoiceItemId String?           @db.Uuid
+  notes         String?
+  createdById   String            @db.Uuid
+  createdAt     DateTime          @default(now()) @db.Timestamptz
+
+  product   Product @relation(fields: [productId], references: [id])
+  branch    Branch  @relation(fields: [branchId], references: [id])
+  vendor    Vendor? @relation(fields: [vendorId], references: [id])
+  createdBy User    @relation(fields: [createdById], references: [id])
+
+  @@index([productId, branchId])
+}
+
+// -----------------------------------------------------------------------------
+// Notifications
+// -----------------------------------------------------------------------------
+
+model NotificationTemplate {
+  id                   String              @id @default(uuid()) @db.Uuid
+  key                  String // "membership.expiring.7d", "payment.receipt", "lead.followup"
+  channel              NotificationChannel
+  language             String              @default("en")
+  providerTemplateName String? // approved WhatsApp template name
+  subject              String?
+  body                 String // with {{placeholders}}
+  isMarketing          Boolean             @default(false) // marketing requires MARKETING_* consent
+  enabled              Boolean             @default(true)
+  updatedAt            DateTime            @updatedAt @db.Timestamptz
+
+  logs NotificationLog[]
+
+  @@unique([key, channel, language])
+}
+
+model NotificationLog {
+  id                String              @id @default(uuid()) @db.Uuid
+  templateId        String?             @db.Uuid
+  memberId          String?             @db.Uuid
+  recipientUserId   String?             @db.Uuid
+  channel           NotificationChannel
+  destination       String // phone / email (masked in UI)
+  status            NotificationStatus  @default(QUEUED)
+  dedupeKey         String?             @unique // e.g. "expiry7d:<subscriptionId>" — prevents duplicate reminders
+  providerMessageId String?
+  errorMessage      String?
+  payload           Json?
+  scheduledFor      DateTime            @default(now()) @db.Timestamptz
+  sentAt            DateTime?           @db.Timestamptz
+  createdAt         DateTime            @default(now()) @db.Timestamptz
+
+  template NotificationTemplate? @relation(fields: [templateId], references: [id])
+  member   Member?               @relation(fields: [memberId], references: [id])
+
+  @@index([status, scheduledFor])
+  @@index([memberId, createdAt])
+}
+
+// -----------------------------------------------------------------------------
+// Data-subject rights (DPDP Act 2023: access, correction, erasure, grievance)
+// -----------------------------------------------------------------------------
+
+enum DataRequestType {
+  ACCESS
+  CORRECTION
+  ERASURE
+  CONSENT_WITHDRAWAL
+  GRIEVANCE
+}
+
+enum DataRequestStatus {
+  OPEN
+  IN_PROGRESS
+  COMPLETED
+  REJECTED
+}
+
+model DataSubjectRequest {
+  id          String            @id @default(uuid()) @db.Uuid
+  memberId    String            @db.Uuid
+  type        DataRequestType
+  details     String?
+  status      DataRequestStatus @default(OPEN)
+  dueBy       DateTime          @db.Timestamptz // set from configured response window
+  resolution  String?
+  handledById String?           @db.Uuid
+  resolvedAt  DateTime?         @db.Timestamptz
+  createdAt   DateTime          @default(now()) @db.Timestamptz
+
+  member Member @relation(fields: [memberId], references: [id])
+
+  @@index([status, dueBy])
+  @@index([memberId])
+}
+
+// -----------------------------------------------------------------------------
+// Audit
+// -----------------------------------------------------------------------------
+
+/// Append-only. UPDATE/DELETE are blocked by trigger in constraints.sql, and the
+/// application DB role has INSERT/SELECT only on this table.
+model AuditLog {
+  id         BigInt      @id @default(autoincrement())
+  occurredAt DateTime    @default(now()) @db.Timestamptz
+  userId     String?     @db.Uuid
+  branchId   String?     @db.Uuid
+  requestId  String?     @db.VarChar(64)
+  ipAddress  String?     @db.Inet
+  action     String // "member.create", "subscription.freeze", "report.revenue.export", "auth.login.failed"
+  entityType String?
+  entityId   String?
+  result     AuditResult
+  before     Json?
+  after      Json?
+  metadata   Json?
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([entityType, entityId])
+  @@index([userId, occurredAt])
+  @@index([action, occurredAt])
+}

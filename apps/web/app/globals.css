@@ -1,0 +1,118 @@
+@import "tailwindcss";
+@import "@fontsource/barlow/400.css";
+@import "@fontsource/barlow/500.css";
+@import "@fontsource/barlow/600.css";
+@import "@fontsource/barlow-condensed/500.css";
+@import "@fontsource/barlow-condensed/600.css";
+@import "@fontsource/barlow-condensed/700.css";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/*
+  Palette — "chalk & iron".
+  Surfaces are chalk and graphite; colour is reserved for status and borrowed from
+  competition weight plates: green 10 kg, yellow 15 kg, blue 20 kg, red 25 kg.
+*/
+:root {
+  --chalk: #f3f5f7;
+  --surface: #ffffff;
+  --surface-2: #e9edf1;
+  --line: #d4dbe2;
+  --ink: #1b2430;
+  --ink-2: #4a5666;
+  --ink-3: #7a8594;
+  --rail: #1b2430;        /* sidebar */
+  --rail-ink: #c9d2dc;
+  --plate-green: #1e7d4f;
+  --plate-yellow: #b98300;
+  --plate-blue: #2556c4;
+  --plate-red: #c22a32;
+  --tint-green: #e3f2ea;
+  --tint-yellow: #fbf1d6;
+  --tint-blue: #e4ebfa;
+  --tint-red: #fae4e5;
+  --focus: #2556c4;
+  color-scheme: light;
+}
+
+.dark {
+  --chalk: #161b22;
+  --surface: #1d232c;
+  --surface-2: #262e39;
+  --line: #333d4a;
+  --ink: #e8edf2;
+  --ink-2: #aab5c2;
+  --ink-3: #7d8896;
+  --rail: #11151b;
+  --rail-ink: #aab5c2;
+  --plate-green: #4cc38a;
+  --plate-yellow: #f0c143;
+  --plate-blue: #7ea2f2;
+  --plate-red: #f0767c;
+  --tint-green: #183428;
+  --tint-yellow: #3a3016;
+  --tint-blue: #1c2846;
+  --tint-red: #3d1d21;
+  --focus: #7ea2f2;
+  color-scheme: dark;
+}
+
+@theme inline {
+  --color-chalk: var(--chalk);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-line: var(--line);
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-ink-3: var(--ink-3);
+  --color-rail: var(--rail);
+  --color-rail-ink: var(--rail-ink);
+  --color-green: var(--plate-green);
+  --color-yellow: var(--plate-yellow);
+  --color-blue: var(--plate-blue);
+  --color-red: var(--plate-red);
+  --color-tint-green: var(--tint-green);
+  --color-tint-yellow: var(--tint-yellow);
+  --color-tint-blue: var(--tint-blue);
+  --color-tint-red: var(--tint-red);
+  --font-sans: "Barlow", system-ui, sans-serif;
+  --font-cond: "Barlow Condensed", "Barlow", system-ui, sans-serif;
+}
+
+html {
+  background: var(--chalk);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  font-variant-numeric: tabular-nums;
+}
+
+h1, h2, h3 {
+  font-family: var(--font-cond);
+  font-weight: 600;
+  line-height: 1.15;
+  letter-spacing: 0.005em;
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+::selection { background: var(--tint-blue); }
+
+dialog::backdrop { background: rgb(15 20 27 / 0.45); }
+dialog[open] { animation: rise 160ms ease-out; }
+@keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+
+@media print {
+  .no-print { display: none !important; }
+  html { background: white; }
+}

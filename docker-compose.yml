@@ -1,0 +1,11 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: gym_owner
+      POSTGRES_PASSWORD: change-me
+      POSTGRES_DB: gymcrm
+    ports: ["5433:5432"]  # 5433 so it never clashes with a local PostgreSQL
+    volumes: [pgdata:/var/lib/postgresql/data]
+volumes:
+  pgdata:

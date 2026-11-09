@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.next/
+apps/api/src/generated/
+.env
+*.log
+deploy/.env.prod
+deploy/backups/

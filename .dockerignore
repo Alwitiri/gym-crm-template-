@@ -1,0 +1,9 @@
+**/node_modules
+**/.next
+**/dist
+apps/api/src/generated
+**/.env
+**/*.log
+deploy/.env.prod
+deploy/backups
+.git
