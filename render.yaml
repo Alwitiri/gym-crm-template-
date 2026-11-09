@@ -1,0 +1,31 @@
+# Render Blueprint for the Gym CRM demo: one web service (website + API), database linked by name.
+services:
+  - type: web
+    name: gym-crm-template-
+    runtime: node
+    region: singapore
+    plan: free
+    branch: main
+    buildCommand: npm install && npm run build
+    startCommand: npm run start
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: diravida-db
+          property: connectionString
+      - key: GYM_DB_NAME
+        value: gymcrm
+      - key: SEED_DEMO
+        value: "1"
+      - key: PAYMENTS_SIMULATOR
+        value: "1"
+      - key: OTP_DEV_ECHO
+        value: "1"
+      - key: LOGIN_RATE_PER_MINUTE
+        value: "60"
+      - key: TZ
+        value: Asia/Kolkata
+      - key: NODE_VERSION
+        value: "22"
+      - key: SESSION_SECRET
+        generateValue: true
